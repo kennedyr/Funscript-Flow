@@ -377,6 +377,7 @@ def load_strings(filename="strings.json"):
         "processing_completed_with_errors": "Processing completed with errors. See run.log for details.",
         "face_inversion_tooltip": "Uses face detection to try to determine the angle of motion, and adjust direction accordingly.",
         "pov_mode_tooltip": "Use this to improve stability for POV videos.",
+        "balance_global_tooltip": "If enabled, the script will try to cancel out camera motion. Disable it for scenes with no camera movement.",
     }
     # Ensure default strings are unicode (Python 3 str is unicode by default)
     # For unicode filenames, always open files with encoding="utf-8" and use str everywhere.
@@ -1391,7 +1392,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
 
     funscript = {"version": "1.0", "actions": actions}
     try:
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(funscript, f, indent=2)
         log_func(STRINGS["funscript_saved"].format(output_path=output_path))
     except Exception as e:
@@ -1623,7 +1624,7 @@ class WorkerThread(QThread):
             # Create timestamp-based filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             log_filename = os.path.join(log_path, f"{timestamp}.log")
-            self.log_file = open(log_filename, "w")
+            self.log_file = open(log_filename, "w", encoding="utf-8")
         except Exception as e:
             self.finished.emit(True, "0s", [f"Cannot open log file: {e}"], [])
             return
@@ -1801,7 +1802,11 @@ class App(QMainWindow):
         self.chk_pov = QCheckBox("POV Mode")
         ToolTip(self.chk_pov, STRINGS["pov_mode_tooltip"])
         mode_layout.addWidget(self.chk_pov)
-        
+
+        self.chk_balance_global = QCheckBox("Balance Global Motion")
+        ToolTip(self.chk_balance_global, STRINGS["balance_global_tooltip"])
+        mode_layout.addWidget(self.chk_balance_global)
+
         mode_layout.addStretch()
         layout.addWidget(mode_group)
         
@@ -2115,7 +2120,7 @@ class App(QMainWindow):
         )
         if file_path:
             try:
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     self.loaded_funscript_data = json.load(f)
                 
                 self.funscript_visualizer.load_funscript(self.loaded_funscript_data)
@@ -2139,7 +2144,7 @@ class App(QMainWindow):
 
             # Load funscript if it exists
             if os.path.exists(funscript_path):
-                with open(funscript_path, 'r') as f:
+                with open(funscript_path, 'r', encoding='utf-8') as f:
                     self.loaded_funscript_data = json.load(f)
                 
                 self.funscript_visualizer.load_funscript(self.loaded_funscript_data)
@@ -2270,12 +2275,13 @@ class App(QMainWindow):
         config["overwrite"] = self.chk_overwrite.isChecked()
         config["vr_mode"] = self.chk_vr.isChecked()
         config["pov_mode"] = self.chk_pov.isChecked()
+        config["balance_global"] = self.chk_balance_global.isChecked()
         config["backend"] = self.backend_combo.currentText()
         config["keyframe_reduction"] = self.chk_keyframe.isChecked()
         
         config_path = "config.json"
         try:
-            with open(config_path, "w") as f:
+            with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
             QMessageBox.information(self, "Config Saved", STRINGS["config_saved"].format(config_path=config_path))
         except Exception as e:
@@ -2286,7 +2292,7 @@ class App(QMainWindow):
         config_path = "config.json"
         if os.path.exists(config_path):
             try:
-                with open(config_path, "r") as f:
+                with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                 
                 # Load after UI is set up
@@ -2307,6 +2313,8 @@ class App(QMainWindow):
             self.chk_vr.setChecked(config["vr_mode"])
         if "pov_mode" in config:
             self.chk_pov.setChecked(config["pov_mode"])
+        if "balance_global" in config:
+            self.chk_balance_global.setChecked(config["balance_global"])
         if "keyframe_reduction" in config:
             self.chk_keyframe.setChecked(config["keyframe_reduction"])
         if "backend" in config and config["backend"] in self.available_backends:
@@ -2339,6 +2347,7 @@ class App(QMainWindow):
                 "keyframe_reduction": self.chk_keyframe.isChecked(),
                 "vr_mode": self.chk_vr.isChecked(),
                 "pov_mode": self.chk_pov.isChecked(),
+                "balance_global": self.chk_balance_global.isChecked(),
                 "backend": self.backend_combo.currentText()
             }
         except Exception as e:
@@ -2546,7 +2555,7 @@ class App(QMainWindow):
                 # Load funscript if dropped
                 if funscript_file:
                     try:
-                        with open(funscript_file, 'r') as f:
+                        with open(funscript_file, 'r', encoding='utf-8') as f:
                             self.loaded_funscript_data = json.load(f)
                         
                         self.funscript_visualizer.load_funscript(self.loaded_funscript_data)
@@ -2607,7 +2616,7 @@ class App(QMainWindow):
 def run_headless(input_path, settings):
     log_filename = "run.log"
     try:
-        logf = open(log_filename, "w")
+        logf = open(log_filename, "w", encoding="utf-8")
     except Exception as e:
         print(f"Error opening log file: {e}")
         return
@@ -2649,6 +2658,7 @@ if __name__ == '__main__':
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
     parser.add_argument("--vr_mode", action="store_true", help="Enable VR Mode (if not set, non‑VR mode is used)")
     parser.add_argument("--pov_mode", action="store_true", help="Enable POV Mode (improves stability for POV videos)")
+    parser.add_argument("--balance_global", action="store_true", help="Balance Global Motion (cancel out camera motion)")
     parser.add_argument("--disable_keyframe_reduction", action="store_false", help="Disable keyframe reduction")
     parser.add_argument("--backend", choices=["CPU", "CUDA", "OpenCL", "DNN"], default="CPU", help="Processing backend (default: CPU)")
     args = parser.parse_args()
@@ -2660,12 +2670,14 @@ if __name__ == '__main__':
         "overwrite": args.overwrite,
         "vr_mode": args.vr_mode,
         "pov_mode": args.pov_mode,
+        "balance_global": args.balance_global,
         "keyframe_reduction": not args.disable_keyframe_reduction,
         "backend": args.backend
     }
     if args.input:
         run_headless(args.input, settings)
     else:
+        print("starting app")
         app = QApplication(sys.argv)
         
         # Set application properties

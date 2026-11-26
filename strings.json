@@ -18,6 +18,7 @@
         "cancel": "Cancel",
         "config_saved": "Config saved to {config_path}",
         "pov_mode_tooltip": "Uses a fixed centerpoint at the bottom. Useful for some POV videos where only one subject is moving.",
+        "balance_global_tooltip": "If enabled, the script will try to cancel out camera motion. Disable it for scenes with no camera movement.",
         "config_load_error": "Error loading config: {error}",
         "no_files_warning": "Please select one or more video files or a folder.",
         "cancelled_by_user": "Processing cancelled by user.",
