@@ -12,3 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["nuitka", "imageio"]
+
+[tool.ruff.lint]
+# Disable specific rules globally
+ignore = ["S110", "BLE001", "TRY002"]

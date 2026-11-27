@@ -14,7 +14,7 @@ The easiest way is to [download it here](https://github.com/Funscript-Flow/Funsc
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies and run
-uv run FunscriptFlow.pyw
+uv run python FunscriptFlow.pyw
 ```
 
 **Using pip:**
