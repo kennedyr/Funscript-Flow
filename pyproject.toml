@@ -2,6 +2,7 @@
 name = "funscript-flow"
 version = "1.0.0"
 description = "Computer vision-based automatic funscript generation"
+readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "numpy",
@@ -16,3 +17,10 @@ build = ["nuitka", "imageio"]
 [tool.ruff.lint]
 # Disable specific rules globally
 ignore = ["S110", "BLE001", "TRY002"]
+
+[project.scripts]
+funscript-flow = "funscript_flow:main"
+
+[build-system]
+requires = ["uv_build>=0.13.10,<0.14.0"]
+build-backend = "uv_build"
