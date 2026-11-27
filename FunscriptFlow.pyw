@@ -1,28 +1,57 @@
 #!/usr/bin/env python3
 
+import argparse
+import concurrent.futures
 import gc
-import os, math, threading, concurrent.futures, json, argparse, time, sys, signal, glob
-import numpy as np
-import cv2
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QPushButton, QLabel, QCheckBox, QProgressBar, QLineEdit, 
-                               QFileDialog, QMessageBox, QTextEdit, QDialog, QComboBox,
-                               QFrame, QScrollArea, QTabWidget, QSlider, QGroupBox, QFormLayout,
-                               QSizePolicy, QStyle)
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot, QUrl, QMimeData
-from PySide6.QtGui import QPixmap, QIcon, QFont, QPainter, QPen, QBrush, QColor, QDragEnterEvent, QDropEvent
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PySide6.QtMultimediaWidgets import QVideoWidget
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
-from multiprocessing import Pool
-from datetime import datetime
-import asyncio
-from queue import Queue, Empty
-from typing import List, Tuple, Optional, Dict
-import numpy.typing as npt
+import glob
+import json
+import math
+import os
+import signal
+import sys
+import threading
+import time
+from datetime import UTC, datetime
+from itertools import repeat
+from queue import Empty, Queue
 
+import cv2
+import numpy as np
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QPainter,
+    QPen,
+)
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QStyle,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 # ---------- Constants ----------
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", ".wmv", ".flv", ".mpg", ".mpeg", ".ts"}
@@ -876,7 +905,7 @@ def precompute_flow_info(p0, p1, config):
     
     # CPU implementation (default)
     cut_threshold = config.get("cut_threshold", 7)
-    
+
     flow = cv2.calcOpticalFlowFarneback(p0, p1, None,
                                         0.5, 3, 15, 3, 5, 1.2, 0)
     if(config.get("pov_mode")):
@@ -886,9 +915,9 @@ def precompute_flow_info(p0, p1, config):
         max = max_divergence(flow)
     pos_center = max[0:2]
     val_pos = max[2]
-        
+
     # Detect cut based on flow map
-    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+    mag = cv2.magnitude(flow[..., 0], flow[..., 1])
     mean_mag = np.mean(mag)
     if mean_mag > cut_threshold:
         is_cut = True
@@ -1022,6 +1051,9 @@ def precompute_wrapper(p, params):
     return precompute_flow_info(
         p[0], p[1], params)
 
+def radial_motion_wrapper(args):
+    return radial_motion_weighted(*args)
+
 def fetch_frames(video_path, chunk, params):
     frames_gray = []
     try:
@@ -1132,9 +1164,12 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     log_func(f"FPS: {fps:.2f}; downsampled to ~{effective_fps:.2f} fps; {len(indices)} frames selected.")
     log_func(f"Using backend: {params.get('backend', 'CPU')}")
     bracket_size = int(params.get("batch_size", 3000.0))
+    norm_win = int(params["norm_window"] * effective_fps)
+    if norm_win % 2 == 0:
+        norm_win += 1
+    half_norm = norm_win // 2
 
     center = None
-    velocity = np.zeros(2, dtype=float)
     final_flow_list = []
 
     # Use a queue for prefetching instead of global variable
@@ -1144,115 +1179,145 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     # (and grayscale for computing flow).
     final_con_list = []
 
-    for chunk_start in range(0, len(indices), bracket_size):
-        if cancel_flag and cancel_flag():
-            log_func("User bailed.")
-            return error_occurred
+    # Threads avoid serializing frame pairs and flow arrays between processes.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=params["threads"]) as thread_pool:
+        for chunk_start in range(0, len(indices), bracket_size):
+            if cancel_flag and cancel_flag():
+                log_func("User bailed.")
+                return error_occurred
 
-        chunk = indices[chunk_start:chunk_start + bracket_size]
-        frame_indices = chunk[:-1]
-        if len(chunk) < 2:
-            continue
+            chunk = indices[chunk_start:chunk_start + bracket_size]
+            frame_indices = chunk[:-1]
+            if len(chunk) < 2:
+                continue
 
-        # Get frames from prefetch queue or fetch directly
-        frames_gray = None
-        if fetch_thread and fetch_thread.is_alive():
-            try:
-                frames_gray = prefetch_queue.get(timeout=30.0)
-            except Empty:
-                log_func(f"WARNING: Prefetch timeout for chunk {chunk_start}")
-        
-        if frames_gray is None:
-            frames_gray = fetch_frames_optimized(video_path, chunk, params)
-
-        if not frames_gray:
-            log_func(f"ERROR: Unable to fetch frames for chunk {chunk_start} - skipping.")
-            continue
-        
-        # Start prefetching next batch
-        if chunk_start + bracket_size < len(indices):
-            next_chunk = indices[chunk_start + bracket_size:chunk_start + 2 * bracket_size]
-            
-            def prefetch_worker(path, chunk_data, params_data, queue):
+            # Get frames from prefetch queue or fetch directly
+            frames_gray = None
+            if fetch_thread and fetch_thread.is_alive():
                 try:
-                    frames = fetch_frames_optimized(path, chunk_data, params_data)
-                    queue.put(frames)
-                except Exception as e:
-                    queue.put([])  # Put empty list on error
+                    frames_gray = prefetch_queue.get(timeout=30.0)
+                except Empty:
+                    log_func(f"WARNING: Prefetch timeout for chunk {chunk_start}")
             
-            fetch_thread = threading.Thread(
-                target=prefetch_worker,
-                args=(video_path, next_chunk, params, prefetch_queue)
-            )
-            fetch_thread.start()
+            if frames_gray is None:
+                frames_gray = fetch_frames_optimized(video_path, chunk, params)
 
-        # Build consecutive pairs
-        pairs = list(zip(frames_gray[:-1], frames_gray[1:]))
-
-        with Pool(processes=params["threads"]) as pool:
-            precomputed = pool.starmap(precompute_wrapper, [(p, params) for p in pairs])
-
-        # import matplotlib.pyplot as plt
-        # mean_mags = [abs(info["val_pos"]) for info in precomputed]
-        # plt.plot(mean_mags)
-        # plt.show()
-        # Add values of val_pos to final_con_list for preview
-        final_con_list.extend([abs(info["val_pos"] * 10) for info in precomputed])
-
-        # 2) Single-thread pass to calculate centers based on the median center of the surrounding second, discarding outliers
-        final_centers = []
-        chosen_center = None
-        for j, info in enumerate(precomputed):
-            # Use the mean center of the 6 frames in each direction, discarding outliers
-            center_list = [info["pos_center"]]
-            for i in range(1, 7):
-                if j - i >= 0:
-                    center_list.append(precomputed[j - i]["pos_center"])
-                if j + i < len(precomputed):
-                    center_list.append(precomputed[j + i]["pos_center"])
-            center_list = np.array(center_list)
-            # Discard outliers from center list
-            center = np.mean(center_list, axis=0)
-            final_centers.append(center)
+            if not frames_gray:
+                log_func(f"ERROR: Unable to fetch frames for chunk {chunk_start} - skipping.")
+                continue
             
-            # Progress update during center computation
-            if progress_callback and j % 24 == 0:  # Update every 24 frames
-                frames_processed = chunk_start + j * 0.5  # Center computation is ~50% of processing
-                prog = min(100, int(100 * frames_processed / len(indices)))
-                progress_callback(prog)
-            
-            # Show preview with the new center on the "next" color frame
-            # e.g. color_pairs[j][1] is the "current" next frame
-            # preview_frame = pairs[j][1].copy()
-            # cv2.circle(preview_frame, (int(center[0]), int(center[1])), 6, (0,255,0), -1)
-            # cv2.imshow("preview", preview_frame)
-            # cv2.waitKey(30)
+            # Start prefetching next batch
+            if chunk_start + bracket_size < len(indices):
+                next_chunk = indices[chunk_start + bracket_size:chunk_start + 2 * bracket_size]
+                
+                def prefetch_worker(path, chunk_data, params_data, queue):
+                    try:
+                        frames = fetch_frames_optimized(path, chunk_data, params_data)
+                        queue.put(frames)
+                    except Exception as e:
+                        queue.put([])  # Put empty list on error
+                
+                fetch_thread = threading.Thread(
+                    target=prefetch_worker,
+                    args=(video_path, next_chunk, params, prefetch_queue)
+                )
+                fetch_thread.start()
 
-        # 3) Concurrency to compute final weighted dot products with actual final center
-        results_in_bracket = []
+            # Build consecutive pairs
+            pairs = list(zip(frames_gray[:-1], frames_gray[1:]))
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=params["threads"]) as ex:
-            dot_futures = []
+            del frames_gray
+
+            precomputed = list(thread_pool.map(
+                precompute_wrapper,
+                pairs,
+                repeat(params)
+            ))
+
+            del pairs
+
+            # import matplotlib.pyplot as plt
+            # mean_mags = [abs(info["val_pos"]) for info in precomputed]
+            # plt.plot(mean_mags)
+            # plt.show()
+            # Add values of val_pos to final_con_list for preview
+            final_con_list.extend([abs(info["val_pos"] * 10) for info in precomputed])
+
+            # 2) Single-thread pass to calculate centers based on the median center of the surrounding second, discarding outliers
+            final_centers = []
+            final_cuts = []
             for j, info in enumerate(precomputed):
-                dot_futures.append(ex.submit(radial_motion_weighted, info["flow"], final_centers[j], info["cut"], params.get("pov_mode", False), params.get("balance_global", True)))
-            dot_vals = [f.result() for f in dot_futures]
+                # Use the mean center of the 6 frames in each direction, discarding outliers
+                center_list = [info["pos_center"]]
+                for i in range(1, 7):
+                    if j - i >= 0:
+                        center_list.append(precomputed[j - i]["pos_center"])
+                    if j + i < len(precomputed):
+                        center_list.append(precomputed[j + i]["pos_center"])
+                center_list = np.array(center_list)
+                # Discard outliers from center list
+                center = np.mean(center_list, axis=0)
+                final_centers.append(center)
+
+                if info["cut"]:
+                    if j >= half_norm:
+                        window = [info["mean_mag"] for info in precomputed[j - half_norm : j + half_norm + 1]]
+                        window_max = max(window)
+                        is_local_max = info["mean_mag"] >= window_max
+                        print(f"Index {j} (val={info['mean_mag']} cut={is_local_max})")
+                        final_cuts.append(is_local_max)
+                    else:
+                        final_cuts.append(True)
+                else:
+                    final_cuts.append(False)
+                
+                # Progress update during center computation
+                if progress_callback and j % 24 == 0:  # Update every 24 frames
+                    frames_processed = chunk_start + j * 0.5  # Center computation is ~50% of processing
+                    prog = min(100, int(100 * frames_processed / len(indices)))
+                    progress_callback(prog)
+                
+                # Show preview with the new center on the "next" color frame
+                # e.g. color_pairs[j][1] is the "current" next frame
+                # preview_frame = pairs[j][1].copy()
+                # cv2.circle(preview_frame, (int(center[0]), int(center[1])), 6, (0,255,0), -1)
+                # cv2.imshow("preview", preview_frame)
+                # cv2.waitKey(30)
+
+            # 3) Concurrency to compute final weighted dot products with actual final center
+            results_in_bracket = []
+
+            dot_args = [
+                (
+                    info["flow"],
+                    final_centers[j],
+                    final_cuts[j],
+                    params.get("pov_mode", False),
+                    params.get("balance_global", True),
+                )
+                for j, info in enumerate(precomputed)
+            ]
+            dot_vals = list(thread_pool.map(radial_motion_weighted, dot_args))
 
 
-        for j, dot_val in enumerate(dot_vals):
-            #flow_val = dot_val * signs[j]
-            is_cut   = precomputed[j]["cut"]
-            final_flow_list.append((dot_val, is_cut, frame_indices[j]))
-            
-            # More frequent progress updates within chunk processing
-            if progress_callback and j % 24 == 0:  # Update every 24 frames
-                frames_processed = chunk_start + j + 1
-                prog = min(100, int(100 * frames_processed / len(indices)))
+            for j, dot_val in enumerate(dot_vals):
+                #flow_val = dot_val * signs[j]
+                is_cut = final_cuts[j]
+                final_flow_list.append((dot_val, is_cut, frame_indices[j]))
+
+                # More frequent progress updates within chunk processing
+                if progress_callback and j % 24 == 0:  # Update every 24 frames
+                    frames_processed = chunk_start + j + 1
+                    prog = min(100, int(100 * frames_processed / len(indices)))
+                    progress_callback(prog)
+
+            # Explicitly release heavy flow arrays before next chunk
+            del precomputed, dot_args, dot_vals
+
+            # Final progress update for this chunk
+            if progress_callback:
+                prog = min(100, int(100 * (chunk_start + len(chunk)) / len(indices)))
                 progress_callback(prog)
-
-        # Final progress update for this chunk
-        if progress_callback:
-            prog = min(100, int(100 * (chunk_start + len(chunk)) / len(indices)))
-            progress_callback(prog)
 
     # Clean up prefetch thread if still running
     if fetch_thread and fetch_thread.is_alive():
@@ -1268,6 +1333,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     # --- Piecewise Integration and Timestamping 
     cum_flow = [0]
     time_stamps = [final_flow_list[0][2]]
+    cut_timestamps = []
 
     for i in range(1, len(final_flow_list)):
         flow_prev, cut_prev, t_prev = final_flow_list[i - 1]
@@ -1275,6 +1341,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
 
         if cut_curr:
             cum_flow.append(0)
+            cut_timestamps.append(t_curr)
         else:
             # Midpoint integration to reduce phase lag
             mid_flow = (flow_prev + flow_curr) / 2
@@ -1334,10 +1401,6 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
 
     smoothed_data = np.convolve(detrended_data, [1/16, 1/4, 3/8, 1/4, 1/16], mode='same')
     # Normalize each window in normalization_window to 0-100
-    norm_win = int(params["norm_window"] * effective_fps)
-    if norm_win % 2 == 0:
-        norm_win += 1
-    half_norm = norm_win // 2
     norm_rolling = np.empty_like(smoothed_data)
     for i in range(len(smoothed_data)):
         start_idx = max(0, i - half_norm)
@@ -1390,7 +1453,28 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     log_func(f"Keyframe reduction: {len(final_actions)} actions computed.")
     actions = final_actions
 
-    funscript = {"version": "1.0", "actions": actions}
+    bookmarks = []
+    prev_cut = None
+    for cut in cut_timestamps:  
+        try:
+            timestamp_ms = int(((cut) / fps) * 1000)
+            if prev_cut is not None and timestamp_ms - prev_cut < 1000:
+                log_func(f"ignoring duplicate cut at {timestamp_ms}")
+                continue  # Skip duplicate cut timestamps
+            timestamp_s = timestamp_ms / 1000.0
+            bookmarks.append({"name": "", "time": datetime.fromtimestamp(timestamp_s, tz=UTC).strftime("%H:%M:%S.%f")[:-3]})
+            prev_cut = timestamp_ms
+        except Exception as e:
+            log_func(f"Error computing bookmark at timestamp {cut}: {e}")
+            error_occurred = True
+
+    funscript = {
+        "version": "1.0",
+        "actions": actions,
+        "metadata": {
+            "bookmarks": bookmarks,
+        }
+    }
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(funscript, f, indent=2)
@@ -2348,7 +2432,8 @@ class App(QMainWindow):
                 "vr_mode": self.chk_vr.isChecked(),
                 "pov_mode": self.chk_pov.isChecked(),
                 "balance_global": self.chk_balance_global.isChecked(),
-                "backend": self.backend_combo.currentText()
+                "backend": self.backend_combo.currentText(),
+                "cut_threshold": 7
             }
         except Exception as e:
             QMessageBox.critical(self, "Parameter Error", f"Invalid parameters: {e}")
@@ -2672,7 +2757,8 @@ if __name__ == '__main__':
         "pov_mode": args.pov_mode,
         "balance_global": args.balance_global,
         "keyframe_reduction": not args.disable_keyframe_reduction,
-        "backend": args.backend
+        "backend": args.backend,
+        "cut_threshold": 7
     }
     if args.input:
         run_headless(args.input, settings)
