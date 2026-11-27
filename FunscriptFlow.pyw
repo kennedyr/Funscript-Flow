@@ -58,7 +58,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", "
 SUPPORTED_VIDEO_PATTERNS = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_VIDEO_EXTENSIONS))
 
 # ---------- GPU Backend Detection ----------
-def get_available_backends() -> Dict[str, bool]:
+def get_available_backends() -> dict[str, bool]:
     """Detect available GPU acceleration backends."""
     backends = {
         "CPU": True,  # Always available
@@ -132,7 +132,7 @@ def get_gpu_info() -> str:
 class AsyncVideoReader:
     """High-performance async video reader with frame buffering and parallel decoding."""
     
-    def __init__(self, video_path: str, width: Optional[int] = None, height: Optional[int] = None, 
+    def __init__(self, video_path: str, width: int | None = None, height: int | None = None, 
                  num_threads: int = 4, buffer_size: int = 100):
         self.video_path = video_path
         self.width = width
@@ -196,10 +196,10 @@ class AsyncVideoReader:
         """Return a frame buffer to the pool."""
         try:
             self.frame_pool.put_nowait(frame)
-        except:
+        except Exception:
             pass  # Pool is full, let GC handle it
     
-    def _decode_frame(self, idx: int, decoder_id: int) -> Optional[np.ndarray]:
+    def _decode_frame(self, idx: int, decoder_id: int) -> np.ndarray | None:
         """Decode a single frame using the specified decoder."""
         with self.decoder_locks[decoder_id]:
             cap = self.decoders[decoder_id]
@@ -217,7 +217,7 @@ class AsyncVideoReader:
                 return frame
             return None
     
-    def _prefetch_worker(self, indices: List[int]):
+    def _prefetch_worker(self, indices: list[int]):
         """Worker thread that prefetches frames into the buffer."""
         decoder_id = 0
         
@@ -232,7 +232,7 @@ class AsyncVideoReader:
             # Round-robin through decoders
             decoder_id = (decoder_id + 1) % self.num_threads
     
-    def get_batch(self, indices: List[int]) -> np.ndarray:
+    def get_batch(self, indices: list[int]) -> np.ndarray:
         """Get a batch of frames by indices with parallel decoding."""
         frames = [None] * len(indices)
         
@@ -274,7 +274,7 @@ class AsyncVideoReader:
         
         return np.array(frames)
     
-    def get_batch_parallel(self, indices: List[int]) -> np.ndarray:
+    def get_batch_parallel(self, indices: list[int]) -> np.ndarray:
         """Alternative parallel batch reading using thread pool."""
         frames = [None] * len(indices)
         
@@ -297,7 +297,7 @@ class AsyncVideoReader:
                 try:
                     pos, frame = future.result()
                     frames[pos] = frame
-                except Exception as e:
+                except Exception:
                     pass
         
         # Fill missing frames
@@ -701,7 +701,7 @@ def detect_cut(pair, log_func=None, threshold=30):
     prev_frame, curr_frame = pair
     diff = np.mean(np.abs(curr_frame.astype(np.float32) - prev_frame.astype(np.float32)))
     if(log_func != None and diff > threshold):
-        log_func(f"Found a cut at " + str(diff))
+        log_func("Found a cut at " + str(diff))
         
     return diff > threshold
 
@@ -887,27 +887,30 @@ def precompute_flow_info(p0, p1, config):
     if backend == "CUDA":
         try:
             return precompute_flow_info_gpu(p0, p1, config.get("cut_threshold", 7))
-        except Exception as e:
+        except Exception:
             # Fall back to CPU if GPU fails
             pass
     elif backend == "OpenCL":
         try:
             return precompute_flow_info_opencl(p0, p1, config)
-        except Exception as e:
+        except Exception:
             # Fall back to CPU if OpenCL fails
             pass
     elif backend == "DNN":
         try:
             return precompute_flow_info_dnn(p0, p1, config)
-        except Exception as e:
+        except Exception:
             # Fall back to CPU if DNN fails
             pass
     
     # CPU implementation (default)
     cut_threshold = config.get("cut_threshold", 7)
 
-    flow = cv2.calcOpticalFlowFarneback(p0, p1, None,
-                                        0.5, 3, 15, 3, 5, 1.2, 0)
+    flow_start = time.perf_counter()
+    flow = cv2.calcOpticalFlowFarneback(p0, p1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    flow_seconds = time.perf_counter() - flow_start
+
+    center_start = time.perf_counter()
     if(config.get("pov_mode")):
         # In pov mode, just use the center of the bottom edge of the frame
         max = (p0.shape[1] // 2, p0.shape[0] - 1, 0)
@@ -915,14 +918,17 @@ def precompute_flow_info(p0, p1, config):
         max = max_divergence(flow)
     pos_center = max[0:2]
     val_pos = max[2]
+    center_seconds = time.perf_counter() - center_start
 
     # Detect cut based on flow map
+    cut_start = time.perf_counter()
     mag = cv2.magnitude(flow[..., 0], flow[..., 1])
     mean_mag = np.mean(mag)
     if mean_mag > cut_threshold:
         is_cut = True
     else:
         is_cut = False
+    cut_seconds = time.perf_counter() - cut_start
 
     cut_center = pos_center[0]
 
@@ -934,7 +940,12 @@ def precompute_flow_info(p0, p1, config):
         "val_neg": val_pos,
         "cut": is_cut,
         "cut_center": cut_center,
-        "mean_mag": mean_mag
+        "mean_mag": mean_mag,
+        "timings": {
+            "farneback": flow_seconds,
+            "center": center_seconds,
+            "cut_detection": cut_seconds
+        }
     }
 
 def precompute_flow_info_opencl(p0, p1, config):
@@ -946,8 +957,7 @@ def precompute_flow_info_opencl(p0, p1, config):
     gpu_p1 = cv2.UMat(p1)
     
     # Compute optical flow on GPU
-    flow_gpu = cv2.calcOpticalFlowFarneback(gpu_p0, gpu_p1, None,
-                                            0.5, 3, 15, 3, 5, 1.2, 0)
+    flow_gpu = cv2.calcOpticalFlowFarneback(gpu_p0, gpu_p1, None, 0.5, 3, 15, 3, 5, 1.2, 0)
     
     # Get flow back to CPU
     flow = flow_gpu.get()
@@ -1066,7 +1076,7 @@ def fetch_frames(video_path, chunk, params):
             buffer_size=min(len(chunk), 100)  # Adaptive buffer size
         )
         batch_frames = vr.get_batch_parallel(chunk)  # Use parallel decoding
-    except Exception as e:
+    except Exception:
         return frames_gray
     vr = None
     gc.collect()
@@ -1082,7 +1092,7 @@ def fetch_frames(video_path, chunk, params):
     return frames_gray
 
 
-def fetch_frames_optimized(video_path: str, chunk: List[int], params: Dict) -> List[np.ndarray]:
+def fetch_frames_optimized(video_path: str, chunk: list[int], params: dict) -> list[np.ndarray]:
     """Optimized frame fetching with direct grayscale conversion."""
     frames_gray = []
     
@@ -1116,7 +1126,7 @@ def fetch_frames_optimized(video_path: str, chunk: List[int], params: Dict) -> L
                     gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
                 frames_gray.append(gray)
                 
-    except Exception as e:
+    except Exception:
         return frames_gray
     finally:
         vr = None
@@ -1158,7 +1168,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
         log_func(f"ERROR: Unable to read video properties: {e}")
         return True
 
-    step = max(1, int(math.ceil(fps / 30.0)))
+    step = max(1, math.ceil(fps / 30.0))
     effective_fps = fps / step
     indices = list(range(0, total_frames, step))
     log_func(f"FPS: {fps:.2f}; downsampled to ~{effective_fps:.2f} fps; {len(indices)} frames selected.")
@@ -1191,6 +1201,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
             if len(chunk) < 2:
                 continue
 
+            fetch_start = time.perf_counter()
             # Get frames from prefetch queue or fetch directly
             frames_gray = None
             if fetch_thread and fetch_thread.is_alive():
@@ -1201,7 +1212,10 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
             
             if frames_gray is None:
                 frames_gray = fetch_frames_optimized(video_path, chunk, params)
-
+            log_func(
+                f"Chunk {chunk_start}: frame fetching took "
+                f"{time.perf_counter() - fetch_start:.2f}s."
+            )
             if not frames_gray:
                 log_func(f"ERROR: Unable to fetch frames for chunk {chunk_start} - skipping.")
                 continue
@@ -1214,7 +1228,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
                     try:
                         frames = fetch_frames_optimized(path, chunk_data, params_data)
                         queue.put(frames)
-                    except Exception as e:
+                    except Exception:
                         queue.put([])  # Put empty list on error
                 
                 fetch_thread = threading.Thread(
@@ -1228,12 +1242,27 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
 
             del frames_gray
 
+            precompute_start = time.perf_counter()
             precomputed = list(thread_pool.map(
                 precompute_wrapper,
                 pairs,
                 repeat(params)
             ))
-
+            log_func(
+                f"Chunk {chunk_start}: precompute thread map took "
+                f"{time.perf_counter() - precompute_start:.2f}s."
+            )
+            stage_timings = {
+                stage: sum(info["timings"][stage] for info in precomputed)
+                for stage in ("farneback", "center", "cut_detection")
+            }
+            log_func(
+                f"Chunk {chunk_start}: precompute summed worker time "
+                f"(Farneback {stage_timings['farneback']:.2f}s, "
+                f"center/divergence {stage_timings['center']:.2f}s, "
+                f"cut detection {stage_timings['cut_detection']:.2f}s; "
+                "summed across frame pairs, not wall time)."
+            )
             del pairs
 
             # import matplotlib.pyplot as plt
@@ -1285,7 +1314,6 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
                 # cv2.waitKey(30)
 
             # 3) Concurrency to compute final weighted dot products with actual final center
-            results_in_bracket = []
 
             dot_args = [
                 (
@@ -1297,8 +1325,12 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
                 )
                 for j, info in enumerate(precomputed)
             ]
-            dot_vals = list(thread_pool.map(radial_motion_weighted, dot_args))
-
+            radial_start = time.perf_counter()
+            dot_vals = list(thread_pool.map(radial_motion_wrapper, dot_args))
+            log_func(
+                f"Chunk {chunk_start}: radial-motion thread map took "
+                f"{time.perf_counter() - radial_start:.2f}s."
+            )
 
             for j, dot_val in enumerate(dot_vals):
                 #flow_val = dot_val * signs[j]
@@ -1330,13 +1362,14 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
         except Empty:
             break
 
+    post_processing_start = time.perf_counter()
     # --- Piecewise Integration and Timestamping 
     cum_flow = [0]
     time_stamps = [final_flow_list[0][2]]
     cut_timestamps = []
 
     for i in range(1, len(final_flow_list)):
-        flow_prev, cut_prev, t_prev = final_flow_list[i - 1]
+        flow_prev, _cut_prev, _t_prev = final_flow_list[i - 1]
         flow_curr, cut_curr, t_curr = final_flow_list[i]
 
         if cut_curr:
@@ -1443,7 +1476,7 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     for ki in key_indices:  
         try:
             timestamp_ms = int(((time_stamps[ki]) / fps) * 1000)
-            pos = int(round(norm_rolling[ki]))
+            pos = round(norm_rolling[ki])
             actions.append({"at": timestamp_ms, "pos": 100-pos})
         except Exception as e:
             log_func(f"Error computing action at segment index {ki}: {e}")
@@ -1482,7 +1515,9 @@ def process_video(video_path, params, log_func, progress_callback=None, cancel_f
     except Exception as e:
         log_func(STRINGS["log_error"].format(error=str(e)))
         error_occurred = True
-    
+    log_func(
+        f"Post-processing took {time.perf_counter() - post_processing_start:.2f}s."
+    )
     # Log processing time
     elapsed_time = time.time() - start_time
     log_func(f"Processing time: {elapsed_time:.2f} seconds")
@@ -1787,7 +1822,6 @@ class MotionIndicatorWindow(QWidget):
         painter.fillRect(self.rect(), QColor(0, 0, 0))
         
         # Draw the vertical bar
-        width = self.width()
         height = self.height()
         
         # Calculate bar height based on position (0-100)
@@ -2508,7 +2542,6 @@ class App(QMainWindow):
             close_button = message_box.addButton("Close", QMessageBox.RejectRole)
             message_box.setDefaultButton(close_button)
 
-            reply = message_box.exec()
             clicked_button = message_box.clickedButton()
 
             if clicked_button == log_button:
